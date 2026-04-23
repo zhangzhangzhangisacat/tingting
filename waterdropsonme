@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>INK — Hand Tracker</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #f0ebe0;
+    overflow: hidden;
+    width: 100vw;
+    height: 100vh;
+    font-family: 'Courier New', monospace;
+  }
+
+  #videoEl {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+    width: 1px; height: 1px;
+  }
+
+  #camCanvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    opacity: 0.3;
+  }
+
+  #inkCanvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+  }
+
+  #overlay {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 20;
+    background: #f0ebe0;
+    transition: opacity 0.8s ease;
+  }
+
+  #overlay.hidden {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  #startBtn {
+    background: transparent;
+    border: 1px solid #111;
+    color: #111;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    padding: 14px 32px;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+  }
+
+  #startBtn:hover {
+    background: #111;
+    color: #f0ebe0;
+  }
+
+  #hud {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 10px;
+    letter-spacing: 0.15em;
+    color: rgba(0,0,0,0.3);
+    z-index: 10;
+    pointer-events: none;
+    text-transform: uppercase;
+  }
+
+  #controls {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    z-index: 10;
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+    background: rgba(240,235,224,0.8);
+    padding: 12px 16px;
+    border: 0.5px solid rgba(0,0,0,0.15);
+  }
+
+  .ctrl-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    color: rgba(0,0,0,0.4);
+    text-transform: uppercase;
+  }
+
+  .ctrl-row input[type=range] {
+    width: 80px;
+    accent-color: #111;
+    cursor: pointer;
+  }
+
+  .ctrl-val {
+    min-width: 20px;
+    text-align: right;
+    color: rgba(0,0,0,0.6);
+  }
+</style>
+</head>
+<body>
+
+<video id="videoEl" playsinline muted autoplay></video>
+<canvas id="camCanvas"></canvas>
+<canvas id="inkCanvas"></canvas>
+
+<div id="overlay">
+  <button id="startBtn">Open Camera</button>
+</div>
+
+<div id="hud">NO HANDS DETECTED</div>
+
+<div id="controls">
+  <div class="ctrl-row">
+    Lines
+    <input type="range" id="densityCtrl" min="20" max="100" value="55">
+    <span class="ctrl-val" id="densityVal">55</span>
+  </div>
+  <div class="ctrl-row">
+    Strength
+    <input type="range" id="strengthCtrl" min="1" max="30" value="12">
+    <span class="ctrl-val" id="strengthVal">12</span>
+  </div>
+  <div class="ctrl-row">
+    Spring
+    <input type="range" id="springCtrl" min="1" max="20" value="6">
+    <span class="ctrl-val" id="springVal">6</span>
+  </div>
+  <div class="ctrl-row">
+    Cam
+    <input type="range" id="camOpacityCtrl" min="0" max="60" value="30">
+    <span class="ctrl-val" id="camOpacityVal">30</span>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1640029074/camera_utils.js"></script>
+
+<script>
+const video    = document.getElementById('videoEl');
+const inkCv    = document.getElementById('inkCanvas');
+const camCv    = document.getElementById('camCanvas');
+const inkCtx   = inkCv.getContext('2d');
+const camCtx   = camCv.getContext('2d');
+const hud      = document.getElementById('hud');
+const overlay  = document.getElementById('overlay');
+const startBtn = document.getElementById('startBtn');
+const ctrlsEl  = document.getElementById('controls');
+
+// ── controls ──────────────────────────────────────────────────────────────
+const densityCtrl    = document.getElementById('densityCtrl');
+const strengthCtrl   = document.getElementById('strengthCtrl');
+const springCtrl     = document.getElementById('springCtrl');
+const camOpacityCtrl = document.getElementById('camOpacityCtrl');
+
+function bindCtrl(ctrl, valId, cb) {
+  ctrl.oninput = () => {
+    document.getElementById(valId).textContent = ctrl.value;
+    if (cb) cb();
+  };
+}
+bindCtrl(densityCtrl,    'densityVal',    () => buildLines());
+bindCtrl(strengthCtrl,   'strengthVal');
+bindCtrl(springCtrl,     'springVal');
+bindCtrl(camOpacityCtrl, 'camOpacityVal', () => {
+  camCv.style.opacity = camOpacityCtrl.value / 100;
+});
+
+// ── canvas size ────────────────────────────────────────────────────────────
+let W = 0, H = 0;
+function resize() {
+  W = inkCv.width  = camCv.width  = window.innerWidth;
+  H = inkCv.height = camCv.height = window.innerHeight;
+  buildLines();
+}
+window.addEventListener('resize', resize);
+
+// ── ink lines ──────────────────────────────────────────────────────────────
+// Each line is a column of nodes connected as a vertical string.
+// Nodes have a rest X (their column) and can be displaced.
+const SEG_H = 12; // vertical spacing between nodes (px)
+
+let lines = [];
+
+class InkLine {
+  constructor(baseX) {
+    this.baseX = baseX;
+    const n = Math.ceil(H / SEG_H) + 2;
+    // ox = current offset from rest, vx = velocity
+    this.ox = new Float32Array(n);
+    this.vx = new Float32Array(n);
+    this.n  = n;
+
+    // static blob data (decorative beads on the string)
+    this.blobs = [];
+    const blobCount = Math.floor(Math.random() * 3);
+    for (let b = 0; b < blobCount; b++) {
+      this.blobs.push({
+        segIdx: 2 + Math.floor(Math.random() * (n - 4)),
+        r: 3 + Math.random() * 7,
+        aspect: 0.6 + Math.random() * 0.8,
+      });
+    }
+  }
+
+  // Push nodes near (hx, hy) with given force magnitude
+  push(hx, hy, force) {
+    const dx = hx - this.baseX;
+    const xDist = Math.abs(dx);
+    const xRadius = W * 0.15;          // how wide the hand influence reaches
+    if (xDist > xRadius) return;
+
+    const xFade = 1 - xDist / xRadius; // 1 at centre, 0 at edge
+    // Push direction: away from hand X
+    const dir = this.baseX < hx ? -1 : 1;
+
+    const yRadius = H * 0.22;
+    const n = this.n;
+
+    for (let i = 0; i < n; i++) {
+      const ny = i * SEG_H;
+      const yDist = Math.abs(ny - hy);
+      if (yDist > yRadius) continue;
+      const yFade = 1 - yDist / yRadius;
+      this.vx[i] += dir * xFade * yFade * force;
+    }
+  }
+
+  update() {
+    const k    = 0.04 + parseFloat(springCtrl.value) * 0.003; // spring constant
+    const damp = 0.80;                                          // damping
+    const n    = this.n;
+    for (let i = 0; i < n; i++) {
+      this.vx[i] += -k * this.ox[i];           // spring back to rest
+      this.vx[i] *= damp;                       // lose energy
+      // tiny organic micro-noise even at rest
+      this.vx[i] += (Math.random() - 0.5) * 0.04;
+      this.ox[i] += this.vx[i];
+      // hard clamp so lines don't fly off screen
+      const maxDisp = W * 0.08;
+      if (this.ox[i] >  maxDisp) { this.ox[i] =  maxDisp; this.vx[i] *= -0.3; }
+      if (this.ox[i] < -maxDisp) { this.ox[i] = -maxDisp; this.vx[i] *= -0.3; }
+    }
+  }
+
+  draw(ctx) {
+    const n = this.n;
+    const nz = () => (Math.random() - 0.5) * 0.6; // tiny calligraphic noise
+
+    // Variable stroke weight — thicker in middle, thinner at ends
+    ctx.strokeStyle = 'rgba(10,8,5,0.82)';
+    ctx.lineWidth = 0.7 + Math.abs(this.ox[Math.floor(n / 2)]) * 0.03;
+    ctx.lineCap = 'round';
+
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x = this.baseX + this.ox[i] + nz();
+      const y = i * SEG_H + nz();
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // draw blobs (ink beads)
+    for (const b of this.blobs) {
+      const i = b.segIdx;
+      const bx = this.baseX + this.ox[i];
+      const by = i * SEG_H;
+      const sway = this.ox[i];
+      ctx.save();
+      ctx.translate(bx, by);
+      ctx.rotate(sway * 0.04);
+      ctx.beginPath();
+      ctx.ellipse(0, 0, b.r * b.aspect, b.r, 0, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(10,8,5,' + (0.5 + Math.random() * 0.35) + ')';
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+function buildLines() {
+  const count = parseInt(densityCtrl.value);
+  lines = [];
+  for (let i = 0; i < count; i++) {
+    lines.push(new InkLine((i / (count - 1)) * W));
+  }
+}
+
+// ── hand data ──────────────────────────────────────────────────────────────
+// We keep the last known hand positions (world coords mapped to canvas)
+let handPts = [];     // [{x, y}] — fingertips + palm
+let prevPts  = [];    // previous frame, for velocity
+
+// Key landmark indices (fingertips + palm base)
+const KEY_LMKS = [0, 4, 8, 12, 16, 20];
+
+function onResults(results) {
+  // draw mirrored camera feed
+  camCtx.save();
+  camCtx.translate(W, 0);
+  camCtx.scale(-1, 1);
+  camCtx.drawImage(results.image, 0, 0, W, H);
+  camCtx.restore();
+
+  prevPts  = handPts;
+  handPts  = [];
+
+  if (results.multiHandLandmarks) {
+    for (const lms of results.multiHandLandmarks) {
+      for (const k of KEY_LMKS) {
+        const lm = lms[k];
+        // mirror X because we flip the camera
+        handPts.push({ x: (1 - lm.x) * W, y: lm.y * H });
+      }
+    }
+  }
+
+  hud.textContent = handPts.length > 0
+    ? `${Math.ceil(handPts.length / KEY_LMKS.length)} HAND${handPts.length > KEY_LMKS.length ? 'S' : ''} — TRACKING`
+    : 'NO HANDS DETECTED';
+}
+
+// ── render loop ────────────────────────────────────────────────────────────
+function loop() {
+  requestAnimationFrame(loop);
+
+  // clear with paper colour — full clear each frame (no fade trail)
+  inkCtx.clearRect(0, 0, W, H);
+
+  // compute per-point velocities to scale force
+  const strength = parseFloat(strengthCtrl.value);
+
+  for (const line of lines) {
+    // apply hand forces
+    for (let p = 0; p < handPts.length; p++) {
+      const pt = handPts[p];
+      const pp = prevPts[p] || pt;
+      const vx = (pt.x - pp.x);
+      const vy = (pt.y - pp.y);
+      const spd = Math.sqrt(vx * vx + vy * vy);
+      // base force + velocity bonus — fast movement = bigger push
+      const force = (strength * 0.4) + spd * strength * 0.12;
+      line.push(pt.x, pt.y, force);
+    }
+
+    line.update();
+    line.draw(inkCtx);
+  }
+}
+
+// ── startup ────────────────────────────────────────────────────────────────
+async function start() {
+  startBtn.disabled = true;
+  startBtn.textContent = 'Loading...';
+
+  try {
+    const hands = new Hands({
+      locateFile: f =>
+        `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${f}`
+    });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.65,
+      minTrackingConfidence: 0.55,
+    });
+    hands.onResults(onResults);
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: 'user' },
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    const cam = new Camera(video, {
+      onFrame: async () => { await hands.send({ image: video }); },
+      width: 640, height: 480,
+    });
+    cam.start();
+
+    overlay.classList.add('hidden');
+    ctrlsEl.style.display = 'flex';
+    resize();
+    loop();
+
+  } catch (e) {
+    startBtn.disabled = false;
+    startBtn.textContent = 'Retry — ' + e.message;
+  }
+}
+
+startBtn.onclick = start;
+resize();
+</script>
+</body>
+</html>
